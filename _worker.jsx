@@ -8,7 +8,10 @@ import { connect } from 'cloudflare:sockets';
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 
-let proxyIP = 'proxyip.zone.id';
+let proxyIP = 'proxyip.zone.id'; // 确保这里有默认值或者通过环境变量设置。
+// --- 新增变量来存储 PROXYIP 的端口 ---
+let proxyPort = 443; // 默认端口为 443
+// --- 结束新增 ---
 
 // --- 新增：伪装页面相关的变量和函数 ---
 let disguiseUrl = 'https://cf-worker-dir-bke.pages.dev/'; // 添加伪装页面的URL
@@ -48,7 +51,13 @@ export default {
 	async fetch(request, env, ctx) {
 		try {
 			userID = env.UUID || userID;
-			proxyIP = env.PROXYIP || proxyIP;
+			// --- 修改：解析 PROXYIP 环境变量 ---
+			if (env.PROXYIP) {
+				const parts = env.PROXYIP.split(':');
+				proxyIP = parts[0];
+				proxyPort = parts.length > 1 ? parseInt(parts[1], 10) : 443;
+			}
+			// --- 结束修改 ---
 
 			// --- **新增逻辑：处理中文环境变量名映射** ---
             // 优先级：先尝试英文变量名 (推荐)，如果不存在，再尝试中文变量名
@@ -75,7 +84,11 @@ export default {
             console.log(`环境变量 SARCASM_MESSAGE 原始值 (英文): ${env.SARCASM_MESSAGE}`);
             console.log(`环境变量 嘲讽语 原始值 (中文): ${env.嘲讽语}`);
             console.log(`最终解析的嘲讽语: ${嘲讽语}`);
-            // --- **调试日志结束** ---
+			// --- 新增调试日志 ---
+			console.log(`环境变量 PROXYIP 原始值: ${env.PROXYIP}`);
+			console.log(`最终解析的 proxyIP: ${proxyIP}`);
+			console.log(`最终解析的 proxyPort: ${proxyPort}`);
+			// --- 调试日志结束 ---
 
 
 			const upgradeHeader = request.headers.get('Upgrade');
@@ -110,7 +123,8 @@ export default {
 				}
 			} else {
 				// 是 WebSocket 请求？那就去处理“秘密隧道”吧
-				return await dynamicProtocolOverWSHandler(request);
+				// 传递 proxyIP 和 proxyPort 给处理函数
+				return await dynamicProtocolOverWSHandler(request, proxyIP, proxyPort);
 			}
 		} catch (err) {
 			/** @type {Error} */ let e = err;
@@ -122,8 +136,10 @@ export default {
 
 /**
  * * @param {import("@cloudflare/workers-types").Request} request
+ * @param {string} fallbackProxyIP // 新增参数，用于回退
+ * @param {number} fallbackProxyPort // 新增参数，用于回退
  */
-async function dynamicProtocolOverWSHandler(request) {
+async function dynamicProtocolOverWSHandler(request, fallbackProxyIP, fallbackProxyPort) {
 
 	/** @type {import("@cloudflare/workers-types").WebSocket[]} */
 	// @ts-ignore
@@ -178,16 +194,18 @@ async function dynamicProtocolOverWSHandler(request) {
 				} `;
 			if (hasError) {
 				// 出错？直接中断，不给机会
+				log(`Error parsing VLESS header: ${message}`);
+				safeCloseWebSocket(webSocket);
 				throw new Error(message); 
-				return;
 			}
 			// 如果是 UDP 但不是 DNS 端口，就拒绝
 			if (isUDP) {
 				if (portRemote === 53) {
 					isDns = true;
 				} else {
+					log('UDP proxy only enabled for DNS which is port 53');
+					safeCloseWebSocket(webSocket);
 					throw new Error('UDP proxy only enable for DNS which is port 53'); 
-					return;
 				}
 			}
 			// 响应头部，版本信息
@@ -197,8 +215,19 @@ async function dynamicProtocolOverWSHandler(request) {
 			if (isDns) {
 				return handleDNSQuery(rawClientData, webSocket, dynamicProtocolResponseHeader, log);
 			}
-			// 处理 TCP 出站连接，真正的“连接世界”
-			handleTCPOutBound(remoteSocketWapper, addressType, addressRemote, portRemote, rawClientData, webSocket, dynamicProtocolResponseHeader, log);
+			// 处理 TCP 出站连接，现在传递新的回退 IP 和端口
+			await handleTCPOutBound(
+				remoteSocketWapper, 
+				addressType, 
+				addressRemote, 
+				portRemote, 
+				rawClientData, 
+				webSocket, 
+				dynamicProtocolResponseHeader, 
+				log, 
+				fallbackProxyIP, // 传递 proxyIP
+				fallbackProxyPort // 传递 proxyPort
+			);
 		},
 		close() {
 			log(`readableWebSocketStream is close`);
@@ -220,7 +249,7 @@ async function dynamicProtocolOverWSHandler(request) {
 /**
  * Handles outbound TCP connections.
  *
- * @param {any} remoteSocket
+ * @param {any} remoteSocketWapper
  * @param {number} addressType The remote address type to connect to.
  * @param {string} addressRemote The remote address to connect to.
  * @param {number} portRemote The remote port to connect to.
@@ -228,28 +257,36 @@ async function dynamicProtocolOverWSHandler(request) {
  * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket to pass the remote socket to.
  * @param {Uint8Array} dynamicProtocolResponseHeader The dynamicProtocol response header.
  * @param {function} log The logging function.
+ * @param {string} fallbackProxyIP The proxy IP to fall back to. // 新增参数
+ * @param {number} fallbackProxyPort The proxy port to fall back to. // 新增参数
  * @returns {Promise<void>} The remote socket.
  */
-async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portRemote, rawClientData, webSocket, dynamicProtocolResponseHeader, log,) {
+async function handleTCPOutBound(remoteSocketWapper, addressType, addressRemote, portRemote, rawClientData, webSocket, dynamicProtocolResponseHeader, log, fallbackProxyIP, fallbackProxyPort) {
 	async function connectAndWrite(address, port) {
 		/** @type {import("@cloudflare/workers-types").Socket} */
-		// 建立与远程目标的 TCP 连接，这是数据的“出口”
 		const tcpSocket = connect({
 			hostname: address,
 			port: port,
 		});
-		remoteSocket.value = tcpSocket;
+		remoteSocketWapper.value = tcpSocket;
 		log(`connected to ${address}:${port}`);
 		const writer = tcpSocket.writable.getWriter();
-		await writer.write(rawClientData); // 首次写入，通常是 TLS 握手
+		await writer.write(rawClientData); 
 		writer.releaseLock();
 		return tcpSocket;
 	}
 
-	// 如果 CF 的 TCP 连接没有收到数据，就尝试“重定向”IP
 	async function retry() {
-		tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
-		// 不管重试成功与否，都要关闭 WebSocket
+		// 修改这里，使用 fallbackProxyIP 和 fallbackProxyPort
+		if (fallbackProxyIP) {
+			log(`retrying with proxyIP: ${fallbackProxyIP}:${fallbackProxyPort}`);
+			tcpSocket = await connectAndWrite(fallbackProxyIP, fallbackProxyPort);
+		} else {
+			// 如果没有 fallbackProxyIP，就直接用原始地址和端口
+			log(`retrying with original address: ${addressRemote}:${portRemote}`);
+			tcpSocket = await connectAndWrite(addressRemote, portRemote);
+		}
+		
 		tcpSocket.closed.catch(error => {
 			console.log('retry tcpSocket closed error', error);
 		}).finally(() => {
@@ -259,9 +296,6 @@ async function handleTCPOutBound(remoteSocket, addressType, addressRemote, portR
 	}
 
 	let tcpSocket = await connectAndWrite(addressRemote, portRemote);
-
-	// 当远程 Socket 准备好后，将其“传递”给 WebSocket
-	// remote--> ws (数据流向：从远程目标到 WebSocket)
 	remoteSocketToWS(tcpSocket, webSocket, dynamicProtocolResponseHeader, retry, log);
 }
 
@@ -623,7 +657,7 @@ async function handleDNSQuery(udpChunk, webSocket, dynamicProtocolResponseHeader
 
 /**
  * * @param {string} userID 
- * @param {string | null} hostName
+ * * @param {string | null} hostName
  * @returns {string}
  */
 function getDynamicProtocolConfig(userID, hostName) {
@@ -659,4 +693,4 @@ clash-meta
 ---------------------------------------------------------------
 ################################################################
 `;
-				}
+}
