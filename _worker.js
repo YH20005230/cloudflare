@@ -9,9 +9,12 @@ import { connect } from 'cloudflare:sockets';
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 
 let proxyIP = 'proxyip.zone.id'; // 确保这里有默认值或者通过环境变量设置。
+// --- 新增变量来存储 PROXYIP 的端口 ---
+let proxyPort = 443; // 默认端口为 443
+// --- 结束新增 ---
 
 // --- 新增：NAT64 开关变量 ---
-let NAT64 = true; // 默认开启 NAT64
+let NAT64 = false; // 默认开启 NAT64
 // --- 结束新增 ---
 
 // 定义伪装页面的URL和处理函数
@@ -51,7 +54,13 @@ export default {
 	async fetch(request, env, ctx) {
 		try {
 			userID = env.UUID || userID;
-			proxyIP = env.PROXYIP || proxyIP;
+			// --- 修改：解析 PROXYIP 环境变量 ---
+			if (env.PROXYIP) {
+				const parts = env.PROXYIP.split(':');
+				proxyIP = parts[0];
+				proxyPort = parts.length > 1 ? parseInt(parts[1], 10) : 443;
+			}
+			// --- 结束修改 ---
 
 			// --- **新增逻辑：处理中文环境变量名映射** ---
             // 优先级：先尝试英文变量名 (推荐)，如果不存在，再尝试中文变量名
@@ -85,7 +94,11 @@ export default {
             console.log(`最终解析的嘲讽语: ${嘲讽语}`);
             console.log(`环境变量 NAT64 原始值: ${env.NAT64}`); // 新增调试日志
             console.log(`最终解析的布尔值 NAT64: ${NAT64}`); // 新增调试日志
-            // --- **调试日志结束** ---
+			// --- 新增调试日志 ---
+			console.log(`环境变量 PROXYIP 原始值: ${env.PROXYIP}`);
+			console.log(`最终解析的 proxyIP: ${proxyIP}`);
+			console.log(`最终解析的 proxyPort: ${proxyPort}`);
+			// --- 调试日志结束 ---
 
 
 			const upgradeHeader = request.headers.get('Upgrade');
@@ -121,8 +134,8 @@ export default {
 				}
 			} else {
 				// 是 WebSocket 请求？那就去处理“秘密隧道”吧
-				// 传递 proxyIP 给处理函数
-				return await dynamicProtocolOverWSHandler(request, proxyIP);
+				// 传递 proxyIP 和 proxyPort 给处理函数
+				return await dynamicProtocolOverWSHandler(request, proxyIP, proxyPort);
 			}
 		} catch (err) {
 			/** @type {Error} */ let e = err;
@@ -135,8 +148,9 @@ export default {
 /**
  * * @param {import("@cloudflare/workers-types").Request} request
  * @param {string} fallbackProxyIP // 新增参数，用于回退
+ * @param {number} fallbackProxyPort // 新增参数，用于回退
  */
-async function dynamicProtocolOverWSHandler(request, fallbackProxyIP) {
+async function dynamicProtocolOverWSHandler(request, fallbackProxyIP, fallbackProxyPort) {
 
 	/** @type {import("@cloudflare/workers-types").WebSocket[]} */
 	// @ts-ignore
@@ -223,6 +237,7 @@ async function dynamicProtocolOverWSHandler(request, fallbackProxyIP) {
 				dynamicProtocolResponseHeader,
 				log,
 				fallbackProxyIP, // 传递 proxyIP
+				fallbackProxyPort, // --- 新增：传递 proxyPort ---
                 NAT64 // 传递 NAT64 变量
 			);
 		},
@@ -254,10 +269,11 @@ async function dynamicProtocolOverWSHandler(request, fallbackProxyIP) {
  * @param {Uint8Array} dynamicProtocolResponseHeader The dynamicProtocol response header.
  * @param {function} log The logging function.
  * @param {string} fallbackProxyIP The proxy IP to fall back to if NAT64 fails.
+ * @param {number} fallbackProxyPort The proxy port to fall back to if NAT64 fails. // --- 新增参数 ---
  * @param {boolean} enableNAT64 Whether NAT64 is enabled. // 新增参数
  * @returns {Promise<void>}
  */
-async function handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, dynamicProtocolResponseHeader, log, fallbackProxyIP, enableNAT64) {
+async function handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, rawClientData, webSocket, dynamicProtocolResponseHeader, log, fallbackProxyIP, fallbackProxyPort, enableNAT64) {
 	let tcpSocket;
 	
 	// --- 尝试 1: 直连 ---
@@ -287,16 +303,16 @@ async function handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, 
 				
 				// --- 尝试 3: 回退到 ProxyIP ---
 				if (fallbackProxyIP) {
-					log(`[Attempt 3/3] NAT64 failed, attempting to fall back to proxyIP: ${fallbackProxyIP}:${portRemote}`);
+					log(`[Attempt 3/3] NAT64 failed, attempting to fall back to proxyIP: ${fallbackProxyIP}:${fallbackProxyPort}`); // --- 修改：使用 fallbackProxyPort ---
 					try {
 						tcpSocket = connect({
 							hostname: fallbackProxyIP,
-							port: portRemote,
+							port: fallbackProxyPort, // --- 修改：使用 fallbackProxyPort ---
 						});
 						await tcpSocket.opened;
-						log(`[Success 3/3] Successfully connected via proxyIP to ${fallbackProxyIP}:${portRemote}`);
+						log(`[Success 3/3] Successfully connected via proxyIP to ${fallbackProxyIP}:${fallbackProxyPort}`); // --- 修改：使用 fallbackProxyPort ---
 					} catch (proxyIPError) {
-						console.error(`[Error 3/3] Fallback to proxyIP failed for ${fallbackProxyIP}:${portRemote}:`, proxyIPError.stack || proxyIPError.message || proxyIPError);
+						console.error(`[Error 3/3] Fallback to proxyIP failed for ${fallbackProxyIP}:${fallbackProxyPort}:`, proxyIPError.stack || proxyIPError.message || proxyIPError); // --- 修改：使用 fallbackProxyPort ---
 						safeCloseWebSocket(webSocket); // 所有尝试都失败，关闭 WebSocket
 						return; // 退出函数，不进行后续操作
 					}
@@ -310,16 +326,16 @@ async function handleTCPOutBound(remoteSocketWapper, addressRemote, portRemote, 
 			log(`[Skipping NAT64] NAT64 is disabled, skipping attempt.`);
 			// --- 尝试 3: 回退到 ProxyIP ---
 			if (fallbackProxyIP) {
-				log(`[Attempt 2/2] Direct failed and NAT64 disabled, attempting to fall back to proxyIP: ${fallbackProxyIP}:${portRemote}`);
+				log(`[Attempt 2/2] Direct failed and NAT64 disabled, attempting to fall back to proxyIP: ${fallbackProxyIP}:${fallbackProxyPort}`); // --- 修改：使用 fallbackProxyPort ---
 				try {
 					tcpSocket = connect({
 						hostname: fallbackProxyIP,
-						port: portRemote,
+						port: fallbackProxyPort, // --- 修改：使用 fallbackProxyPort ---
 					});
 					await tcpSocket.opened;
-					log(`[Success 2/2] Successfully connected via proxyIP to ${fallbackProxyIP}:${portRemote}`);
+					log(`[Success 2/2] Successfully connected via proxyIP to ${fallbackProxyIP}:${fallbackProxyPort}`); // --- 修改：使用 fallbackProxyPort ---
 				} catch (proxyIPError) {
-					console.error(`[Error 2/2] Fallback to proxyIP failed for ${fallbackProxyIP}:${portRemote}:`, proxyIPError.stack || proxyIPError.message || proxyIPError);
+					console.error(`[Error 2/2] Fallback to proxyIP failed for ${fallbackProxyIP}:${fallbackProxyPort}:`, proxyIPError.stack || proxyIPError.message || proxyIPError); // --- 修改：使用 fallbackProxyPort ---
 					safeCloseWebSocket(webSocket); // 所有尝试都失败，关闭 WebSocket
 					return; // 退出函数，不进行后续操作
 				}
@@ -822,4 +838,4 @@ async function connectViaNAT64(address, port) {
     });
     await tcpSocket.opened;
     return { tcpSocket }; 
-}
+	}
